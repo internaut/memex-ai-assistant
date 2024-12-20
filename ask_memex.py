@@ -1,14 +1,19 @@
+import logging
 import sys
 from io import BytesIO
 from pathlib import Path
 from argparse import ArgumentParser
 from tarfile import TarFile
+from logging import getLogger
 
 from gnupg import GPG
+from sentence_transformers import CrossEncoder
 
 
 DEFAULT_ENCODING = 'utf-8'
 DEFAULT_MEMEXDB_PATH = Path(__file__).parent.resolve() / 'memexdb'
+DEFAULT_EMBEDDINGS_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEFAULT_NUM_CONTEXT_DOCS = 10
 
 
 def printerr(*args):
@@ -26,28 +31,58 @@ def decrypt_memex(fpath, encoding):
                 txtbuffer = tar.extractfile(f'./{date}.txt')
             except KeyError:
                 raise SystemError(f'could not find memex text file in tar archive inside "{fpath}"')
-            return txtbuffer.read().decode(encoding)
+            return date, txtbuffer.read().decode(encoding)
         else:
             raise SystemError(f'could not decrypt file "{fpath}"; details: {decrypted.status}')
 
-
 argparser = ArgumentParser()
-argparser.add_argument('query')
+argparser.add_argument('query', nargs='?', default=None)
 argparser.add_argument('--memexdb', default=str(DEFAULT_MEMEXDB_PATH))
+argparser.add_argument('--num_context_docs', type=int, default=DEFAULT_NUM_CONTEXT_DOCS)
 argparser.add_argument('--encoding', default=DEFAULT_ENCODING)
+argparser.add_argument('--verbose', action='store_true')
 
 args = argparser.parse_args()
 
+logging.basicConfig()
+logger = getLogger(__name__)
+if args.verbose:
+    logger.setLevel(logging.DEBUG)
+
+if args.query:
+    q = args.query
+else:
+    q = input('Please enter your query: ')
+
+q = q.strip()
+
+logger.info(f'user query: {q}')
+
 gpg = GPG()
 
-memexdb_path = Path(args.memexdb)
+logger.info(f'loading embeddings model "{DEFAULT_EMBEDDINGS_MODEL}"')
+model = CrossEncoder(DEFAULT_EMBEDDINGS_MODEL)
 
+memexdb_path = Path(args.memexdb)
+logger.info(f'loading documents from memexdb at "{memexdb_path}"')
 if not memexdb_path.exists():
     printerr(f'memexdb path does not exist: "{memexdb_path}"')
     exit(1)
 
-for fpath in sorted(memexdb_path.glob('*/*.tar.gpg')):
-    print(fpath)
-    doc = decrypt_memex(fpath, encoding=args.encoding)
-    print(doc)
-    break
+docs = []
+doc_dates = []
+for i, fpath in enumerate(sorted(memexdb_path.glob('*/*.tar.gpg'))):
+    date, text = decrypt_memex(fpath, encoding=args.encoding)
+    docs.append(text)
+    doc_dates.append(date)
+    if i >= 10:
+        break
+
+logger.info(f'ranking documents')
+ranks = model.rank(q, docs, top_k=args.num_context_docs)
+
+for rank in ranks:
+    index = rank['corpus_id']
+    print(f"{rank['score']:.2f}\t{doc_dates[index]}\t{docs[index]}")
+
+logger.info('done')
