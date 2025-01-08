@@ -5,6 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "python-gnupg>=0.5.3",
+    "pgpy>=0.6.0",
     "sentence-transformers>=3.3.1",
 ]
