@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 import sys
 import multiprocessing as mp
@@ -13,6 +14,7 @@ from pathlib import Path
 from argparse import ArgumentParser
 from tarfile import TarFile
 from logging import getLogger
+from threading import Thread
 
 import pgpy
 from sentence_transformers import CrossEncoder
@@ -25,9 +27,11 @@ DEFAULT_ENCODING = 'utf-8'
 DEFAULT_MEMEXDB_PATH = HERE / 'memexdb'
 DEFAULT_GPG_PRIV_KEY = Path().home() / '.gnupg' / 'default-sec.asc'
 DEFAULT_EMBEDDINGS_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEFAULT_LANG_DETECT_MODEL = "papluca/xlm-roberta-base-language-detection"
 DEFAULT_NUM_CONTEXT_DOCS = 20
 DEFAULT_N_WORKERS = mp.cpu_count() - 1
-LLM_MODEL_PATH = (HERE / '..' / 'llm_models' / 'Llama-3.2-3B-Instruct').resolve()
+LLM_MODEL_PATH = (HERE / '..' / 'llm_models' / 'Llama-3.2-1B-Instruct').resolve()
+MAX_OUTPUT_TOKENS = 2048
 
 CONTEXT_DOC_TEMPLATE = """$date
 ----------
@@ -37,12 +41,27 @@ $text
 ///
 """
 
-INSTRUCTIONS_TEMPLATE = """Die folgenden Texte sind Tagebucheinträge. Sie sind nicht sortiert und starten mit einem 
+INSTRUCTIONS_TEMPLATE = {
+    'en': """You are a helpful assistant.
+    
+The following texts are diary entries. They are not sorted and start with a date in year-month-day format, 
+followed by "----------" and then the text entry. Each diary entry ends with "///". Answer any questions related to the
+journal entries. Here are the journal entries:
+
+$documents
+""",
+    'de': """Du bist ein hilfreicher Assistent.
+
+Die folgenden Texte sind Tagebucheinträge. Sie sind nicht sortiert und starten mit einem 
 Datum im Jahr-Monat-Tag Format, gefolgt von "----------" und im Anschluss dem Texteintrag. Jeder Tagebucheintrag endet
 mit "///". Beantworte alle Fragen in Bezug auf die Tagebucheinträge. Hier sind die Tagebucheinträge:
 
 $documents
 """
+}
+
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def printerr(*args):
@@ -50,13 +69,32 @@ def printerr(*args):
     print(*args, file=sys.stderr)
 
 
+def add_message(messages, role, msg):
+    messages.append({"role": role, "content": msg})
+
+
+def add_system_message(messages, msg):
+    messages.append({"role": 'system', "content": msg})
+
+
+def add_user_message(messages, msg):
+    messages.append({"role": 'user', "content": msg})
+
+
+def add_assistant_message(messages, msg):
+    messages.append({"role": 'assistant', "content": msg})
+
+
 def load_documents(memexdb, num_workers, encoding, key, key_passwd, sample, use_cache):
     memexdb_path = Path(memexdb)
     if not memexdb_path.exists():
-        printerr(f'memexdb path does not exist: "{memexdb_path}"')
+        printerr(f'The memexdb path does not exist: "{memexdb_path}"')
         exit(1)
 
     memexfiles = sorted(memexdb_path.glob('*/*.tar.gpg'))
+    if not memexfiles:
+        printerr(f'Could not find any memex files in memexdb at "{memexdb_path}".')
+        exit(1)
     logger.info(f'found {len(memexfiles)} documents')
 
     if use_cache:
@@ -113,7 +151,23 @@ def decrypt_doc(fpath, encoding, key_fpath, key_passwd):
     return date, txtbuffer.read().decode(encoding)
 
 
-def process_input(initial_query):
+def generate_system_instructions(query, doc_dates, docs, crossenc, num_context_docs, lang, num_workers):
+    print(f'Finding the {num_context_docs} most relevant documents out of {len(docs)} documents ...')
+    logger.info(f'ranking {len(docs)} documents using {num_workers} workers')
+    ranks = crossenc.rank(query, docs, top_k=num_context_docs, num_workers=num_workers, show_progress_bar=True)
+
+    context_documents = []
+    context_templ = string.Template(CONTEXT_DOC_TEMPLATE)
+    for rank in ranks:
+        index = rank['corpus_id']
+        context_documents.append(context_templ.substitute(date=doc_dates[index], text=docs[index]))
+
+    instructions_templ = string.Template(INSTRUCTIONS_TEMPLATE[lang])
+    return instructions_templ.substitute(documents='\n'.join(context_documents))
+
+
+def process_input(initial_query, messages, doc_dates, docs, tokenizer, crossenc, llm, num_context_docs, lang,
+                  num_workers):
     if initial_query:
         q = initial_query
     else:
@@ -123,23 +177,31 @@ def process_input(initial_query):
     logger.info(f'user query: {q}')
 
     if q.lower() == 'quit':
-        return False
+        return False, []
 
-    print(f'Finding the {args.num_context_docs} most relevant documents out of {len(docs)} documents ...')
-    logger.info(f'ranking {len(docs)} documents using {args.num_workers} workers')
-    ranks = model.rank(q, docs, top_k=args.num_context_docs, num_workers=args.num_workers, show_progress_bar=True)
+    instructions = generate_system_instructions(q, doc_dates, docs, crossenc, num_context_docs, lang, num_workers)
+    add_system_message(messages, instructions)
 
-    context_documents = []
-    context_templ = string.Template(CONTEXT_DOC_TEMPLATE)
-    for rank in ranks:
-        index = rank['corpus_id']
-        context_documents.append(context_templ.substitute(date=doc_dates[index], text=docs[index]))
+    add_user_message(messages, q)
 
-    instructions_templ = string.Template(INSTRUCTIONS_TEMPLATE)
-    instructions = instructions_templ.substitute(documents='\n'.join(context_documents))
-    print(instructions)
+    messages_transformed = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    input_data = tokenizer(messages_transformed, return_tensors="pt").to(llm.device)
 
-    return True
+    streamer = transformers.TextIteratorStreamer(tokenizer, skip_prompt=True, timeout=None)
+    thread = Thread(target=llm.generate, kwargs=dict(input_data, streamer=streamer, max_new_tokens=MAX_OUTPUT_TOKENS))
+
+    print('Assistant:')
+    thread.start()
+    generated_text = ""
+    for new_text in streamer:
+        print(new_text, end='')
+        generated_text += new_text
+
+    thread.join()
+    add_assistant_message(messages, generated_text)
+    print()
+
+    return True, messages
 
 
 if __name__ == '__main__':
@@ -182,8 +244,19 @@ if __name__ == '__main__':
             print('The provided key password is incorrect.')
             exit(1)
 
-    logger.info(f'loading embeddings model "{DEFAULT_EMBEDDINGS_MODEL}"')
-    model = CrossEncoder(DEFAULT_EMBEDDINGS_MODEL)
+    logger.info(f'loading CrossEncoder model "{DEFAULT_EMBEDDINGS_MODEL}"')
+    crossenc = CrossEncoder(DEFAULT_EMBEDDINGS_MODEL)
+
+    logger.info(f'loading language detection model "{DEFAULT_LANG_DETECT_MODEL}"')
+    lang_classifier = transformers.pipeline("text-classification", model=DEFAULT_LANG_DETECT_MODEL, use_fast=False)
+
+    logger.info(f'loading LLM and tokenizer "{LLM_MODEL_PATH}"')
+    llm = transformers.AutoModelForCausalLM.from_pretrained(
+        str(LLM_MODEL_PATH),
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    tokenizer = transformers.AutoTokenizer.from_pretrained(str(LLM_MODEL_PATH))
 
     print('Loading memex documents ...')
     doc_dates, docs = load_documents(
@@ -196,10 +269,27 @@ if __name__ == '__main__':
         use_cache=args.use_cache
     )
 
+    lang_classif_res = lang_classifier(docs[0], top_k=1, truncation=True)
+    lang = 'en'
+    if lang_classif_res:
+        lang = lang_classif_res[0]['label']
+    print(f'Detected document language "{lang}".')
+
+    if lang not in INSTRUCTIONS_TEMPLATE:
+        printerr(f'Language not supported: "{lang}".')
+        exit(1)
+
     cont = True
+    messages = []
     initial_query = args.query
     while cont:
-        cont = process_input(initial_query)
+        cont, messages = process_input(initial_query, messages, doc_dates, docs,
+                                       crossenc=crossenc,
+                                       tokenizer=tokenizer,
+                                       llm=llm,
+                                       num_context_docs=args.num_context_docs,
+                                       lang=lang,
+                                       num_workers=args.num_workers)
         initial_query = None
 
     print('Done.')
