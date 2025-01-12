@@ -14,13 +14,11 @@ from pathlib import Path
 from argparse import ArgumentParser
 from tarfile import TarFile
 from logging import getLogger
-from threading import Thread
 
 import pgpy
 from sentence_transformers import CrossEncoder
 from llama_cpp import Llama
 import transformers
-import torch
 
 
 HERE = Path(__file__).parent.resolve()
@@ -31,7 +29,8 @@ DEFAULT_EMBEDDINGS_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_LANG_DETECT_MODEL = "papluca/xlm-roberta-base-language-detection"
 DEFAULT_NUM_CONTEXT_DOCS = 5
 DEFAULT_N_WORKERS = mp.cpu_count() - 1
-MAX_OUTPUT_TOKENS = 1024
+DEFAULT_MAX_INPUT_TOKENS = 10240
+NO_ANSW_SENTINEL = 'NO_ANSWER'
 
 CONTEXT_DOC_TEMPLATE = """$date
 ----------
@@ -42,22 +41,29 @@ $text
 """
 
 INSTRUCTIONS_TEMPLATE = {
-    'en': """You are a helpful assistant.
+    'en': f"""You are a helpful assistant.
     
 The following texts are diary entries. They are not sorted and start with a date in year-month-day format, 
 followed by "----------" and then the text entry. Each diary entry ends with "///". Answer any questions related to the
-journal entries. Here are the journal entries:
+journal entries. If you cannot give an answer, only return the text "{NO_ANSW_SENTINEL}". Here are the journal entries:
 
 $documents
 """,
-    'de': """Du bist ein hilfreicher Assistent.
+    'de': f"""Du bist ein hilfreicher und höflicher Assistent, der in den Antworten siezt.
 
 Die folgenden Texte sind Tagebucheinträge. Sie sind nicht sortiert und starten mit einem 
 Datum im Jahr-Monat-Tag Format, gefolgt von "----------" und im Anschluss dem Texteintrag. Jeder Tagebucheintrag endet
-mit "///". Beantworte alle Fragen in Bezug auf die Tagebucheinträge. Hier sind die Tagebucheinträge:
+mit "///". Beantworte alle Fragen in Bezug auf die Tagebucheinträge. Falls sich eine Frage nicht beantworten lässt,
+antworte ausschließlich mit dem Text "{NO_ANSW_SENTINEL}". Hier sind die Tagebucheinträge:
 
 $documents
 """
+}
+
+NO_ANSW_INFO = {
+    'en': 'I cannot give an answer to this question with the provided diary notes. Please try to rephrase your '
+          'question.',
+    'de': 'Auf diese Frage kann ich anhand der bereitgestellten Tagebuchnotizen keine Antwort geben. Versuchen Sie bitte, Ihre Frage anders zu formulieren.'
 }
 
 
@@ -148,57 +154,76 @@ def decrypt_doc(fpath, encoding, key_fpath, key_passwd):
     return date, txtbuffer.read().decode(encoding)
 
 
-def process_input(initial_query, messages, doc_dates, docs, crossenc, llm, num_context_docs, lang,
-                  num_workers, logger):
-    if initial_query:
-        q = initial_query
-    else:
-        q = input('Please enter your query. Enter "quit" to stop the program.\n\n')
+def process_input(query, messages, doc_dates, docs, crossenc, llm, num_context_docs, lang, num_workers, no_answ_counter,
+                  logger):
+    while not query:
+        query = input('Please enter your query. '
+                      'Enter "quit" to stop the program. '
+                      'Enter "flush" to reset the chat context.\n\n')
 
-    q = q.strip()
-    logger.info(f'user query: {q}')
+        query = query.strip()
+        logger.info(f'user query: {query}')
 
-    if q.lower() == 'quit':
-        return False, []
+        if query.lower() == 'quit':
+            logger.info('exiting...')
+            return False, [], None, 0
+        elif query.lower() == 'flush':
+            query = None
+            messages = []
+            logger.info('cleared chat context')
 
-    logger.info('generating system instructions')
-    print(f'Finding the {num_context_docs} most relevant documents out of {len(docs)} documents ...')
-    logger.info(f'ranking {len(docs)} documents using {num_workers} workers')
-    ranks = crossenc.rank(q, docs, top_k=num_context_docs, num_workers=num_workers, show_progress_bar=True)
+    if not messages:
+        logger.info('generating system instructions')
+        print(f'Finding the {num_context_docs} most relevant documents out of {len(docs)} documents ...')
+        logger.info(f'ranking {len(docs)} documents using {num_workers} workers')
+        ranks = crossenc.rank(query, docs, top_k=num_context_docs, num_workers=num_workers, show_progress_bar=True)
 
-    context_documents = []
-    context_templ = string.Template(CONTEXT_DOC_TEMPLATE)
-    for rank in ranks:
-        index = rank['corpus_id']
-        context_documents.append(context_templ.substitute(date=doc_dates[index], text=docs[index]))
+        context_documents = []
+        context_templ = string.Template(CONTEXT_DOC_TEMPLATE)
+        for rank in ranks:
+            index = rank['corpus_id']
+            context_documents.append(context_templ.substitute(date=doc_dates[index], text=docs[index]))
 
-    instructions_templ = string.Template(INSTRUCTIONS_TEMPLATE[lang])
-    instructions = instructions_templ.substitute(documents='\n'.join(context_documents))
-    add_system_message(messages, instructions)
+        instructions_templ = string.Template(INSTRUCTIONS_TEMPLATE[lang])
+        instructions = instructions_templ.substitute(documents='\n'.join(context_documents))
+        add_system_message(messages, instructions)
 
-    add_user_message(messages, q)
+    add_user_message(messages, query)
 
     logger.info('generating output text for the following input messages:')
     for msg in messages:
         logger.info(f'> [{msg["role"]}] {textwrap.shorten(msg["content"], width=50, placeholder="...")}')
 
-    streamer = llm.create_chat_completion(messages=messages, stream=True)
-
     print('Assistant answer:')
+    streamer = llm.create_chat_completion(messages=messages, stream=True)
+    hold_back_n_chars = len(NO_ANSW_SENTINEL)
+    held_back = True
     generated_text = ''
     for output in streamer:
         if output['choices']:
-           output_chunk = output['choices'][0]['delta']
-           if output_chunk and 'content' in output_chunk:
-               new_text = output_chunk['content']
-               print(new_text, end='')
-               generated_text += new_text
+            output_chunk = output['choices'][0]['delta']
+            if output_chunk and 'content' in output_chunk:
+                new_text = output_chunk['content']
+                if len(generated_text) > hold_back_n_chars:
+                    if held_back:
+                        print(generated_text, end='')
+                        held_back = False
+                    print(new_text, end='')
+                generated_text += new_text
+                if generated_text == NO_ANSW_SENTINEL:
+                    logger.info(f'received "no answer" sentinel response from LLM; no answer counter is at '
+                                f'{no_answ_counter}')
+                    if no_answ_counter == 0:
+                        return True, [], query, no_answ_counter + 1
+                    else:
+                        print(NO_ANSW_INFO[lang])
+                        return True, [], None, 0
+    else:
+        add_assistant_message(messages, generated_text)
+        print('\n')
+        logger.info(f'generated output text of length {len(generated_text)}')
 
-    add_assistant_message(messages, generated_text)
-    print()
-    logger.info(f'generated output text of length {len(generated_text)}')
-
-    return True, messages
+    return True, messages, None, 0
 
 
 if __name__ == '__main__':
@@ -208,6 +233,7 @@ if __name__ == '__main__':
     argparser.add_argument('--keypw', default='')
     argparser.add_argument('--memexdb', default=str(DEFAULT_MEMEXDB_PATH))
     argparser.add_argument('--num-context-docs', type=int, default=DEFAULT_NUM_CONTEXT_DOCS)
+    argparser.add_argument('--num-context-tokens', type=int, default=DEFAULT_MAX_INPUT_TOKENS)
     argparser.add_argument('--num-workers', type=int, default=DEFAULT_N_WORKERS)
     argparser.add_argument('--sample', type=int, default=0)
     argparser.add_argument('--encoding', default=DEFAULT_ENCODING)
@@ -251,7 +277,8 @@ if __name__ == '__main__':
     llm = Llama.from_pretrained(
         repo_id="hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF",
         filename="*q8_0.gguf",
-        n_ctx=10240
+        n_ctx=args.num_context_tokens,
+        verbose=False
     )
 
     print('Loading memex documents ...')
@@ -278,15 +305,18 @@ if __name__ == '__main__':
 
     cont = True
     messages = []
-    initial_query = args.query
+    query = args.query
+    no_answ_counter = 0
     while cont:
-        cont, messages = process_input(initial_query, messages, doc_dates, docs,
-                                       crossenc=crossenc,
-                                       llm=llm,
-                                       num_context_docs=args.num_context_docs,
-                                       lang=lang,
-                                       num_workers=args.num_workers,
-                                       logger=logger)
-        initial_query = None
+        cont, messages, query, no_answ_counter = process_input(
+            query, messages, doc_dates, docs,
+            crossenc=crossenc,
+            llm=llm,
+            num_context_docs=args.num_context_docs,
+            lang=lang,
+            num_workers=args.num_workers,
+            no_answ_counter=no_answ_counter,
+            logger=logger
+        )
 
     print('Done.')
