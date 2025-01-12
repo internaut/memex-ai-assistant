@@ -2,7 +2,6 @@
 
 ## TODOs
 
-- ruff
 - code docs
 - readme
 - publish
