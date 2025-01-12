@@ -1,3 +1,12 @@
+"""
+AI assistant for encrypted *memex* notes.
+
+Uses an RAG approach with CrossEncoder to fetch the relevant documents and Llama 3.2 as LLM for text generation.
+
+January 2025
+Author: Markus Konrad <post@mkonrad.net>
+"""
+
 import logging
 import random
 import sys
@@ -31,11 +40,11 @@ DEFAULT_LANG_DETECT_MODEL = "papluca/xlm-roberta-base-language-detection"
 DEFAULT_NUM_CONTEXT_DOCS = 20
 DEFAULT_N_WORKERS = mp.cpu_count() - 1
 DEFAULT_MAX_INPUT_TOKENS = 20480
-CROSS_ENC_BATCH_SIZE = 1
-# LLM_LOAD_PARAMS = dict(
-#     repo_id="hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF",
-#     filename="*q8_0.gguf"
-# )
+CROSS_ENC_BATCH_SIZE = 2
+NO_ANSW_SENTINEL = "NO_ANSWER"
+LLM_LOAD_PARAMS = dict(
+    repo_id="hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF", filename="*q8_0.gguf"
+)
 # LLM_LOAD_PARAMS = dict(
 #     repo_id="hugging-quants/Llama-3.2-3B-Instruct-Q8_0-GGUF",
 #     filename="*q8_0.gguf"
@@ -43,10 +52,9 @@ CROSS_ENC_BATCH_SIZE = 1
 # LLM_LOAD_PARAMS = dict(
 #     model_path='../llm_models/Llama-3.2-1B-Instruct/Llama-3.2-1B-Instruct-F16.gguf'
 # )
-LLM_LOAD_PARAMS = dict(
-    model_path="../llm_models/Llama-3.2-3B-Instruct/Llama-3.2-3B-Instruct-F16.gguf"
-)
-NO_ANSW_SENTINEL = "NO_ANSWER"
+# LLM_LOAD_PARAMS = dict(
+#     model_path="../llm_models/Llama-3.2-3B-Instruct/Llama-3.2-3B-Instruct-F16.gguf"
+# )
 
 CONTEXT_DOC_TEMPLATE = """$date
 ----------
@@ -90,22 +98,27 @@ def printerr(*args):
 
 
 def add_message(messages, role, msg):
+    """Add a message for a specific role to the chat history."""
     messages.append({"role": role, "content": msg})
 
 
 def add_system_message(messages, msg):
+    """Add a system message to the chat history."""
     messages.append({"role": "system", "content": msg})
 
 
 def add_user_message(messages, msg):
+    """Add a user message to the chat history."""
     messages.append({"role": "user", "content": msg})
 
 
 def add_assistant_message(messages, msg):
+    """Add an assistant message to the chat history."""
     messages.append({"role": "assistant", "content": msg})
 
 
 def log_time(logger, t_start, msg=""):
+    """Helper function to log time since `t_start`."""
     if msg:
         msg += " "
     logger.info(f"{msg}took {round(time() - t_start, 1)} sec.")
@@ -114,6 +127,19 @@ def log_time(logger, t_start, msg=""):
 def load_documents(
     memexdb, num_workers, encoding, key, key_passwd, sample, use_cache, logger
 ):
+    """
+    Load documents from memex store.
+
+    :param memexdb: memex files loaction
+    :param num_workers: number of workers for parallel decryption
+    :param encoding: text file encoding
+    :param key: path to private GPG key
+    :param key_passwd: key password, if key is locked
+    :param sample: if not None, draw a sample of documents
+    :param use_cache: if True, cache the decrypted documents in /tmp -- use with care!
+    :param logger: logger instance
+    :return: tuple (document dates list, document list, document fragments list)
+    """
     memexdb_path = Path(memexdb)
     if not memexdb_path.exists():
         printerr(f'The memexdb path does not exist: "{memexdb_path}"')
@@ -147,6 +173,7 @@ def load_documents(
             f"{num_workers} workers"
         )
 
+        # decrypt the files in parallel
         decrypt_memex_w_args = partial(
             decrypt_doc, encoding=encoding, key_fpath=key, key_passwd=key_passwd
         )
@@ -172,6 +199,15 @@ def load_documents(
 
 
 def decrypt_doc(fpath, encoding, key_fpath, key_passwd):
+    """
+    Decrypt an encrypted memex file.
+
+    :param fpath: path to memex file
+    :param encoding: text file encoding
+    :param key_fpath: path to private GPG key
+    :param key_passwd: key password, if key is locked
+    :return: tuple with (date, decrypted text)
+    """
     date = fpath.name.removesuffix(".tar.gpg")
 
     msg = pgpy.PGPMessage.from_file(fpath)
@@ -207,6 +243,24 @@ def process_input(
     no_answ_counter,
     logger,
 ):
+    """
+    Prompt and process user input, show LLM output.
+
+    :param query: initial input query or None; in latter case, the user will be prompted for a query
+    :param messages: chat history messages
+    :param doc_dates: document dates as from `load_documents()`
+    :param docs: document texts as from `load_documents()`
+    :param doc_fragments: document fragments as from `load_documents()`
+    :param crossenc: cross-encoder model for document retrieval
+    :param llm: large lang. model for text generation
+    :param num_context_docs: number of documents to provide as RAG context
+    :param lang: detected document language
+    :param num_workers: number of workers for parallel processing
+    :param no_answ_counter: counter for "no answer" responses from the LLM
+    :param logger: logger instance
+    :return: tuple (continue flag, chat history messages, next query, updated counter for "no answer" responses from the LLM)
+    """
+    # handle input
     while not query:
         query = input(
             "Please enter your query. "
@@ -225,7 +279,9 @@ def process_input(
             messages = []
             logger.info("cleared chat context")
 
+    # generate initial system instructions including the RAG context if not given yet
     if not messages:
+        # perform document retrieval using the cross encoder model on the document fragments
         logger.info("generating system instructions")
         print(
             f"Finding the {num_context_docs} most relevant documents out of {len(docs)} documents ..."
@@ -250,6 +306,8 @@ def process_input(
             show_progress_bar=True,
         )
         log_time(logger, t_start)
+
+        # identify the documents belonging to the ranked fragments
         context_documents = []
         context_templ = string.Template(CONTEXT_DOC_TEMPLATE)
         added_doc_indices = set()
@@ -271,12 +329,14 @@ def process_input(
                 if len(added_doc_indices) >= num_context_docs:
                     break
 
+        # construct the instructions
         instructions_templ = string.Template(INSTRUCTIONS_TEMPLATE[lang])
         instructions = instructions_templ.substitute(
             documents="\n".join(context_documents)
         )
         add_system_message(messages, instructions)
 
+    # add the user input
     add_user_message(messages, query)
 
     logger.info("generating output text for the following input messages:")
@@ -285,6 +345,7 @@ def process_input(
             f"> [{msg['role']}] {textwrap.shorten(msg['content'], width=50, placeholder='...')}"
         )
 
+    # generate the LLM response
     print("Assistant answer:")
     t_start = time()
     streamer = llm.create_chat_completion(messages=messages, stream=True)
@@ -321,33 +382,77 @@ def process_input(
     return True, messages, None, 0
 
 
-if __name__ == "__main__":
+def main():
+    """Script main routine."""
+
+    # set up and parse arguments
     argparser = ArgumentParser()
-    argparser.add_argument("query", nargs="?", default=None)
-    argparser.add_argument("--key", default=str(DEFAULT_GPG_PRIV_KEY))
-    argparser.add_argument("--keypw", default="")
-    argparser.add_argument("--memexdb", default=str(DEFAULT_MEMEXDB_PATH))
     argparser.add_argument(
-        "--num-context-docs", type=int, default=DEFAULT_NUM_CONTEXT_DOCS
+        "query",
+        nargs="?",
+        default=None,
+        help="initial query; leave empty to be prompted",
     )
     argparser.add_argument(
-        "--num-context-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS
+        "--key",
+        default=str(DEFAULT_GPG_PRIV_KEY),
+        help="path to private GPG key file in ASC format",
     )
-    argparser.add_argument("--num-workers", type=int, default=DEFAULT_N_WORKERS)
-    argparser.add_argument("--sample", type=int, default=0)
-    argparser.add_argument("--encoding", default=DEFAULT_ENCODING)
-    argparser.add_argument("--verbose", action="store_true")
-    argparser.add_argument("--use-cache", action="store_true")
+    argparser.add_argument(
+        "--keypw",
+        default="",
+        help="private GPG key password; leave empty to be prompted when key is locked",
+    )
+    argparser.add_argument(
+        "--memexdb", default=str(DEFAULT_MEMEXDB_PATH), help="path to memex files"
+    )
+    argparser.add_argument(
+        "--num-context-docs",
+        type=int,
+        default=DEFAULT_NUM_CONTEXT_DOCS,
+        help="number of memex notes that make up the RAG context",
+    )
+    argparser.add_argument(
+        "--num-context-tokens",
+        type=int,
+        default=DEFAULT_MAX_INPUT_TOKENS,
+        help="maximum number of input tokens",
+    )
+    argparser.add_argument(
+        "--num-workers",
+        type=int,
+        default=DEFAULT_N_WORKERS,
+        help="number of worker processes used for parallel processing",
+    )
+    argparser.add_argument(
+        "--sample",
+        type=int,
+        default=0,
+        help="draw only a sample of the memex notes by specifying the sample size",
+    )
+    argparser.add_argument(
+        "--encoding", default=DEFAULT_ENCODING, help="memex notes encoding"
+    )
+    argparser.add_argument(
+        "--verbose", action="store_true", help="turn on verbose output"
+    )
+    argparser.add_argument(
+        "--use-cache",
+        action="store_true",
+        help="cache decrypted notes in temp. directory; use with care!",
+    )
 
     args = argparser.parse_args()
 
     print("Starting up the assistent ...")
 
+    # set up logging
     logging.basicConfig()
     logger = getLogger(__name__)
     if args.verbose:
         logger.setLevel(logging.INFO)
 
+    # set up GPG key
     logger.info(f'using GPG key "{args.key}"')
     key, _ = pgpy.PGPKey.from_file(args.key)
     if args.keypw:
@@ -368,9 +473,11 @@ if __name__ == "__main__":
             print("The provided key password is incorrect.")
             exit(1)
 
+    # load cross encoder model
     logger.info(f'loading CrossEncoder model "{DEFAULT_EMBEDDINGS_MODEL}"')
     crossenc = CrossEncoder(DEFAULT_EMBEDDINGS_MODEL)
 
+    # load language classifier model and LLM
     logger.info(f'loading language detection model "{DEFAULT_LANG_DETECT_MODEL}"')
     lang_classifier = transformers.pipeline(
         "text-classification", model=DEFAULT_LANG_DETECT_MODEL, use_fast=False
@@ -385,6 +492,7 @@ if __name__ == "__main__":
     else:
         llm = Llama(**llm_load_params)
 
+    # decrypt memex documents
     print("Loading memex documents ...")
     doc_dates, docs, doc_fragments = load_documents(
         memexdb=args.memexdb,
@@ -397,6 +505,7 @@ if __name__ == "__main__":
         logger=logger,
     )
 
+    # detect language using the first document
     lang_classif_res = lang_classifier(docs[0], top_k=1, truncation=True)
     lang = "en"
     if lang_classif_res:
@@ -407,6 +516,7 @@ if __name__ == "__main__":
         printerr(f'Language not supported: "{lang}".')
         exit(1)
 
+    # run chat loop
     cont = True
     messages = []
     query = args.query
@@ -428,3 +538,8 @@ if __name__ == "__main__":
         )
 
     print("Done.")
+
+
+# script entry point
+if __name__ == "__main__":
+    main()
