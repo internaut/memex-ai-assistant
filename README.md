@@ -2,7 +2,6 @@
 
 ## TODOs
 
-- doc. search via doc. fragments, but pass full docs
 - ruff
 - code docs
 - readme

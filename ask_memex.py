@@ -7,6 +7,7 @@ import pickle
 import hashlib
 import tempfile
 import textwrap
+from time import time
 from functools import partial
 from getpass import getpass
 from io import BytesIO
@@ -27,9 +28,24 @@ DEFAULT_MEMEXDB_PATH = HERE / 'memexdb'
 DEFAULT_GPG_PRIV_KEY = Path().home() / '.gnupg' / 'default-sec.asc'
 DEFAULT_EMBEDDINGS_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_LANG_DETECT_MODEL = "papluca/xlm-roberta-base-language-detection"
-DEFAULT_NUM_CONTEXT_DOCS = 5
+DEFAULT_NUM_CONTEXT_DOCS = 20
 DEFAULT_N_WORKERS = mp.cpu_count() - 1
-DEFAULT_MAX_INPUT_TOKENS = 10240
+DEFAULT_MAX_INPUT_TOKENS = 20480
+CROSS_ENC_BATCH_SIZE = 1
+# LLM_LOAD_PARAMS = dict(
+#     repo_id="hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF",
+#     filename="*q8_0.gguf"
+# )
+# LLM_LOAD_PARAMS = dict(
+#     repo_id="hugging-quants/Llama-3.2-3B-Instruct-Q8_0-GGUF",
+#     filename="*q8_0.gguf"
+# )
+# LLM_LOAD_PARAMS = dict(
+#     model_path='../llm_models/Llama-3.2-1B-Instruct/Llama-3.2-1B-Instruct-F16.gguf'
+# )
+LLM_LOAD_PARAMS = dict(
+    model_path='../llm_models/Llama-3.2-3B-Instruct/Llama-3.2-3B-Instruct-F16.gguf'
+)
 NO_ANSW_SENTINEL = 'NO_ANSWER'
 
 CONTEXT_DOC_TEMPLATE = """$date
@@ -43,18 +59,19 @@ $text
 INSTRUCTIONS_TEMPLATE = {
     'en': f"""You are a helpful assistant.
     
-The following texts are diary entries. They are not sorted and start with a date in year-month-day format, 
-followed by "----------" and then the text entry. Each diary entry ends with "///". Answer any questions related to the
-journal entries. If you cannot give an answer, only return the text "{NO_ANSW_SENTINEL}". Here are the journal entries:
+The following texts are diary entries of the user that will ask you some questions. They are not sorted and start with a
+date in year-month-day format, followed by "----------" and then the text entry. Each diary entry ends with "///".
+Answer any questions related to the journal entries. If you cannot give an answer, only return the text
+"{NO_ANSW_SENTINEL}". Here are the journal entries:
 
 $documents
 """,
     'de': f"""Du bist ein hilfreicher und höflicher Assistent, der in den Antworten siezt.
 
-Die folgenden Texte sind Tagebucheinträge. Sie sind nicht sortiert und starten mit einem 
-Datum im Jahr-Monat-Tag Format, gefolgt von "----------" und im Anschluss dem Texteintrag. Jeder Tagebucheintrag endet
-mit "///". Beantworte alle Fragen in Bezug auf die Tagebucheinträge. Falls sich eine Frage nicht beantworten lässt,
-antworte ausschließlich mit dem Text "{NO_ANSW_SENTINEL}". Hier sind die Tagebucheinträge:
+Die folgenden Texte sind Tagebucheinträge des Nutzers, der gleich einige Fragen stellen wird. Sie sind nicht sortiert
+und starten mit einem Datum im Jahr-Monat-Tag Format, gefolgt von "----------" und im Anschluss dem Texteintrag. Jeder 
+Tagebucheintrag endet mit "///". Beantworte alle Fragen in Bezug auf die Tagebucheinträge. Falls sich eine Frage nicht
+beantworten lässt, antworte ausschließlich mit dem Text "{NO_ANSW_SENTINEL}". Hier sind die Tagebucheinträge:
 
 $documents
 """
@@ -86,6 +103,12 @@ def add_user_message(messages, msg):
 
 def add_assistant_message(messages, msg):
     messages.append({"role": 'assistant', "content": msg})
+
+
+def log_time(logger, t_start, msg=''):
+    if msg:
+        msg += ' '
+    logger.info(f'{msg}took {round(time() - t_start, 1)} sec.')
 
 
 def load_documents(memexdb, num_workers, encoding, key, key_passwd, sample, use_cache, logger):
@@ -122,16 +145,22 @@ def load_documents(memexdb, num_workers, encoding, key, key_passwd, sample, use_
 
         decrypt_memex_w_args = partial(decrypt_doc, encoding=encoding, key_fpath=key, key_passwd=key_passwd)
 
+        t_start = time()
         with mp.Pool(num_workers) as proc_pool:
             res = proc_pool.map(decrypt_memex_w_args, memexfiles)
             doc_dates, docs = zip(*res)
+        log_time(logger, t_start)
 
         if cachefile:
             logger.info(f'saving documents to cache')
             with open(cachefile, 'wb') as f:
                 pickle.dump((doc_dates, docs), f)
 
-    return doc_dates, docs
+    # create document fragments for better search results simply by splitting by line
+    doc_fragments = [[line.strip() for line in doc.split('\n') if line.strip()] for doc in docs]
+    logger.info(f'generated {sum(map(len, doc_fragments))} document fragments')
+
+    return doc_dates, docs, doc_fragments
 
 
 def decrypt_doc(fpath, encoding, key_fpath, key_passwd):
@@ -154,8 +183,8 @@ def decrypt_doc(fpath, encoding, key_fpath, key_passwd):
     return date, txtbuffer.read().decode(encoding)
 
 
-def process_input(query, messages, doc_dates, docs, crossenc, llm, num_context_docs, lang, num_workers, no_answ_counter,
-                  logger):
+def process_input(query, messages, doc_dates, docs, doc_fragments, crossenc, llm, num_context_docs, lang, num_workers,
+                  no_answ_counter, logger):
     while not query:
         query = input('Please enter your query. '
                       'Enter "quit" to stop the program. '
@@ -175,14 +204,35 @@ def process_input(query, messages, doc_dates, docs, crossenc, llm, num_context_d
     if not messages:
         logger.info('generating system instructions')
         print(f'Finding the {num_context_docs} most relevant documents out of {len(docs)} documents ...')
-        logger.info(f'ranking {len(docs)} documents using {num_workers} workers')
-        ranks = crossenc.rank(query, docs, top_k=num_context_docs, num_workers=num_workers, show_progress_bar=True)
 
+        doc_frags_flat = []
+        doc_frags_indices = []
+        for doc_index, doc_frags in enumerate(doc_fragments):
+            doc_frags_flat.extend(doc_frags)
+            doc_frags_indices.extend([doc_index] * len(doc_frags))
+        assert len(doc_frags_flat) == len(doc_frags_indices)
+
+        logger.info(f'ranking {len(doc_frags_flat)} document fragments using {num_workers} workers and batch size {CROSS_ENC_BATCH_SIZE}')
+        t_start = time()
+        ranking_res = crossenc.rank(query, doc_frags_flat, num_workers=num_workers, batch_size=CROSS_ENC_BATCH_SIZE,
+                                    show_progress_bar=True)
+        log_time(logger, t_start)
         context_documents = []
         context_templ = string.Template(CONTEXT_DOC_TEMPLATE)
-        for rank in ranks:
-            index = rank['corpus_id']
-            context_documents.append(context_templ.substitute(date=doc_dates[index], text=docs[index]))
+        added_doc_indices = set()
+        for rank in ranking_res:
+            index_into_doc_frags = rank['corpus_id']
+            doc_index = doc_frags_indices[index_into_doc_frags]
+
+            if doc_index not in added_doc_indices:
+                ctx_doc_date = doc_dates[doc_index]
+                ctx_doc_text = docs[doc_index]
+                logger.info(f'> adding context document from {ctx_doc_date}: '
+                            f'{textwrap.shorten(ctx_doc_text, width=50, placeholder="...")}')
+                context_documents.append(context_templ.substitute(date=ctx_doc_date, text=ctx_doc_text))
+                added_doc_indices.add(doc_index)
+                if len(added_doc_indices) >= num_context_docs:
+                    break
 
         instructions_templ = string.Template(INSTRUCTIONS_TEMPLATE[lang])
         instructions = instructions_templ.substitute(documents='\n'.join(context_documents))
@@ -195,6 +245,7 @@ def process_input(query, messages, doc_dates, docs, crossenc, llm, num_context_d
         logger.info(f'> [{msg["role"]}] {textwrap.shorten(msg["content"], width=50, placeholder="...")}')
 
     print('Assistant answer:')
+    t_start = time()
     streamer = llm.create_chat_completion(messages=messages, stream=True)
     hold_back_n_chars = len(NO_ANSW_SENTINEL)
     held_back = True
@@ -222,6 +273,7 @@ def process_input(query, messages, doc_dates, docs, crossenc, llm, num_context_d
         add_assistant_message(messages, generated_text)
         print('\n')
         logger.info(f'generated output text of length {len(generated_text)}')
+    log_time(logger, t_start)
 
     return True, messages, None, 0
 
@@ -247,7 +299,7 @@ if __name__ == '__main__':
     logging.basicConfig()
     logger = getLogger(__name__)
     if args.verbose:
-        logger.setLevel(logging.DEBUG)
+        logger.setLevel(logging.INFO)
 
     logger.info(f'using GPG key "{args.key}"')
     key, _ = pgpy.PGPKey.from_file(args.key)
@@ -273,16 +325,20 @@ if __name__ == '__main__':
     logger.info(f'loading language detection model "{DEFAULT_LANG_DETECT_MODEL}"')
     lang_classifier = transformers.pipeline("text-classification", model=DEFAULT_LANG_DETECT_MODEL, use_fast=False)
 
-    logger.info('loading LLM')
-    llm = Llama.from_pretrained(
-        repo_id="hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF",
-        filename="*q8_0.gguf",
+    logger.info(f'loading LLM with parameters {LLM_LOAD_PARAMS}')
+    llm_load_params = LLM_LOAD_PARAMS.copy()
+    llm_load_params.update(dict(
         n_ctx=args.num_context_tokens,
-        verbose=False
-    )
+        verbose=args.verbose
+    ))
+
+    if 'repo_id' in llm_load_params:
+        llm = Llama.from_pretrained(**llm_load_params)
+    else:
+        llm = Llama(**llm_load_params)
 
     print('Loading memex documents ...')
-    doc_dates, docs = load_documents(
+    doc_dates, docs, doc_fragments = load_documents(
         memexdb=args.memexdb,
         num_workers=args.num_workers,
         encoding=args.encoding,
@@ -309,7 +365,7 @@ if __name__ == '__main__':
     no_answ_counter = 0
     while cont:
         cont, messages, query, no_answ_counter = process_input(
-            query, messages, doc_dates, docs,
+            query, messages, doc_dates, docs, doc_fragments,
             crossenc=crossenc,
             llm=llm,
             num_context_docs=args.num_context_docs,
